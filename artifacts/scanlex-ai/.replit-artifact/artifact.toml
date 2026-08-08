@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "ScanLex AI"
+description = "A mobile-first AI comic translation app that analyzes manga, manhwa, manhua, comics, and scanned pages, then returns readable translated images and chapters with secure server-side Gemini processing."
+version = "1.0.0"
+id = "artifacts/scanlex-ai"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 20558
+
+[services.development]
+run = "pnpm --filter @workspace/scanlex-ai run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/scanlex-ai", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/scanlex-ai/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "20558"
+BASE_PATH = "/"

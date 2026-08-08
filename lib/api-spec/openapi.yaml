@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: translation
+    description: Comic translation operations
 paths:
   /healthz:
     get:
@@ -24,6 +26,84 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /config:
+    get:
+      operationId: getAppConfig
+      tags: [translation]
+      summary: Get public application configuration
+      responses:
+        "200":
+          description: Public configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppConfig"
+  /translate/image:
+    post:
+      operationId: translateImage
+      tags: [translation]
+      summary: Translate one comic image
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ImageTranslationInput"
+      responses:
+        "200":
+          description: Translated image and region analysis
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranslationResult"
+        "400":
+          description: Invalid upload
+        "503":
+          description: Translation service unavailable
+  /translate/chapter:
+    post:
+      operationId: translateChapter
+      tags: [translation]
+      summary: Translate an image chapter or comic archive
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ChapterTranslationInput"
+      responses:
+        "200":
+          description: Translated chapter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChapterResult"
+        "400":
+          description: Invalid chapter upload
+        "503":
+          description: Translation service unavailable
+  /translate/chapters:
+    post:
+      operationId: translateChapters
+      tags: [translation]
+      summary: Translate up to three chapter files
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/MultiChapterTranslationInput"
+      responses:
+        "200":
+          description: Translated chapters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MultiChapterResult"
+        "400":
+          description: Invalid chapter uploads
+        "503":
+          description: Translation service unavailable
 components:
   schemas:
     HealthStatus:
@@ -33,4 +113,167 @@ components:
           type: string
       required:
         - status
+    AppConfig:
+      type: object
+      properties:
+        serviceConfigured:
+          type: boolean
+        model:
+          type: string
+        maxImageBytes:
+          type: number
+        maxChapterBytes:
+          type: number
+        supportedLanguages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Language"
+      required: [serviceConfigured, model, maxImageBytes, maxChapterBytes, supportedLanguages]
+    Language:
+      type: object
+      properties:
+        code:
+          type: string
+        label:
+          type: string
+        nativeLabel:
+          type: string
+        direction:
+          type: string
+          enum: [ltr, rtl]
+      required: [code, label, nativeLabel, direction]
+    ImageTranslationInput:
+      type: object
+      properties:
+        file:
+          type: string
+          format: binary
+        targetLanguage:
+          type: string
+      required: [file, targetLanguage]
+    ChapterTranslationInput:
+      type: object
+      properties:
+        file:
+          type: string
+          format: binary
+        images:
+          type: array
+          items:
+            type: string
+            format: binary
+        targetLanguage:
+          type: string
+      required: [targetLanguage]
+    MultiChapterTranslationInput:
+      type: object
+      properties:
+        files:
+          type: array
+          maxItems: 3
+          items:
+            type: string
+            format: binary
+        targetLanguage:
+          type: string
+      required: [files, targetLanguage]
+    TextRegion:
+      type: object
+      properties:
+        text:
+          type: string
+        translatedText:
+          type: string
+        x:
+          type: number
+        y:
+          type: number
+        width:
+          type: number
+        height:
+          type: number
+        orientation:
+          type: string
+        regionType:
+          type: string
+        confidence:
+          type: number
+        fontSize:
+          type: number
+        align:
+          type: string
+          enum: [left, center, right]
+      required: [text, translatedText, x, y, width, height, orientation, regionType, confidence, fontSize, align]
+    TranslationResult:
+      type: object
+      properties:
+        id:
+          type: string
+        originalImage:
+          type: string
+        translatedImage:
+          type: string
+        width:
+          type: number
+        height:
+          type: number
+        regions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TextRegion"
+        targetLanguage:
+          type: string
+        model:
+          type: string
+      required: [id, originalImage, translatedImage, width, height, regions, targetLanguage, model]
+    ChapterPage:
+      type: object
+      properties:
+        pageNumber:
+          type: number
+        originalImage:
+          type: string
+        translatedImage:
+          type: string
+        width:
+          type: number
+        height:
+          type: number
+        regions:
+          type: array
+          items:
+            $ref: "#/components/schemas/TextRegion"
+      required: [pageNumber, originalImage, translatedImage, width, height, regions]
+    ChapterResult:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        pageCount:
+          type: number
+        pages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChapterPage"
+        targetLanguage:
+          type: string
+        model:
+          type: string
+      required: [id, name, pageCount, pages, targetLanguage, model]
+    MultiChapterResult:
+      type: object
+      properties:
+        id:
+          type: string
+        chapterCount:
+          type: number
+        chapters:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChapterResult"
+        targetLanguage:
+          type: string
+      required: [id, chapterCount, chapters, targetLanguage]
 
