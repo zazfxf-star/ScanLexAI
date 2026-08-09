@@ -36,6 +36,154 @@ function containsArabic(text: string): boolean {
   return /[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]/u.test(text);
 }
 
+function luminance(red: number, green: number, blue: number): number {
+  return red * 0.2126 + green * 0.7152 + blue * 0.0722;
+}
+
+function colorDistance(
+  red: number,
+  green: number,
+  blue: number,
+  otherRed: number,
+  otherGreen: number,
+  otherBlue: number,
+): number {
+  return Math.sqrt(
+    (red - otherRed) ** 2 +
+      (green - otherGreen) ** 2 +
+      (blue - otherBlue) ** 2,
+  );
+}
+
+function regionBounds(region: TextRegion, width: number, height: number) {
+  const left = clamp(Math.round(region.x * width), 0, Math.max(0, width - 1));
+  const top = clamp(Math.round(region.y * height), 0, Math.max(0, height - 1));
+  return {
+    left,
+    top,
+    width: Math.max(1, Math.min(Math.round(region.width * width), width - left)),
+    height: Math.max(1, Math.min(Math.round(region.height * height), height - top)),
+  };
+}
+
+function makeLetteringMask(
+  source: Buffer,
+  softened: Buffer,
+  width: number,
+  height: number,
+  regions: TextRegion[],
+): Uint8Array {
+  const mask = new Uint8Array(width * height);
+
+  for (const region of regions) {
+    if (!region.translatedText.trim()) continue;
+    const box = regionBounds(region, width, height);
+    let averageLuma = 0;
+    let samples = 0;
+    for (let y = box.top; y < box.top + box.height; y += 1) {
+      for (let x = box.left; x < box.left + box.width; x += 1) {
+        const offset = (y * width + x) * 4;
+        averageLuma += luminance(source[offset], source[offset + 1], source[offset + 2]);
+        samples += 1;
+      }
+    }
+    averageLuma /= Math.max(1, samples);
+
+    // Leave a small perimeter intact so bubble borders and panel lines remain untouched.
+    const inset = Math.max(1, Math.round(Math.min(box.width, box.height) * 0.035));
+    const textIsDark = averageLuma >= 125;
+    for (let y = box.top + inset; y < box.top + box.height - inset; y += 1) {
+      for (let x = box.left + inset; x < box.left + box.width - inset; x += 1) {
+        const offset = (y * width + x) * 4;
+        const nearby = offset;
+        const currentLuma = luminance(source[offset], source[offset + 1], source[offset + 2]);
+        const nearbyLuma = luminance(
+          softened[nearby],
+          softened[nearby + 1],
+          softened[nearby + 2],
+        );
+        const contrast = currentLuma - nearbyLuma;
+        const chromaticContrast = colorDistance(
+          source[offset],
+          source[offset + 1],
+          source[offset + 2],
+          softened[nearby],
+          softened[nearby + 1],
+          softened[nearby + 2],
+        );
+        const likelyLettering = textIsDark
+          ? contrast < -24 || (contrast < -16 && chromaticContrast > 30)
+          : contrast > 24 || (contrast > 16 && chromaticContrast > 30);
+        if (likelyLettering) mask[y * width + x] = 1;
+      }
+    }
+  }
+
+  // Include antialiased edges, but only around detected lettering pixels.
+  const expanded = new Uint8Array(mask);
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const index = y * width + x;
+      if (
+        mask[index - 1] ||
+        mask[index + 1] ||
+        mask[index - width] ||
+        mask[index + width]
+      ) {
+        expanded[index] = 1;
+      }
+    }
+  }
+  return expanded;
+}
+
+function inpaintLettering(source: Buffer, width: number, height: number, mask: Uint8Array): Buffer {
+  const result = Buffer.from(source);
+  const filled = new Uint8Array(width * height);
+  for (let index = 0; index < filled.length; index += 1) filled[index] = mask[index] ? 0 : 1;
+
+  // Propagate nearby, unmasked artwork into only the detected letter pixels.
+  for (let pass = 0; pass < 18; pass += 1) {
+    const next = Buffer.from(result);
+    const nextFilled = new Uint8Array(filled);
+    let changed = false;
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (!mask[index] || filled[index]) continue;
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        let weightTotal = 0;
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (!dx && !dy) continue;
+            const neighbor = (y + dy) * width + x + dx;
+            if (!filled[neighbor]) continue;
+            const weight = 1 / (Math.abs(dx) + Math.abs(dy));
+            const offset = neighbor * 4;
+            red += result[offset] * weight;
+            green += result[offset + 1] * weight;
+            blue += result[offset + 2] * weight;
+            weightTotal += weight;
+          }
+        }
+        if (weightTotal < 1.5) continue;
+        const offset = index * 4;
+        next[offset] = Math.round(red / weightTotal);
+        next[offset + 1] = Math.round(green / weightTotal);
+        next[offset + 2] = Math.round(blue / weightTotal);
+        nextFilled[index] = 1;
+        changed = true;
+      }
+    }
+    result.set(next);
+    filled.set(nextFilled);
+    if (!changed) break;
+  }
+  return result;
+}
+
 export async function renderTranslatedImage(
   original: Buffer,
   regions: TextRegion[],
@@ -43,31 +191,29 @@ export async function renderTranslatedImage(
   const metadata = await sharp(original).metadata();
   const width = metadata.width ?? 1;
   const height = metadata.height ?? 1;
-  const translatedRegions = regions.filter((region) => region.translatedText.trim());
-  const coverInputs: { input: Buffer; left: number; top: number }[] = [];
+  const { data: source } = await sharp(original).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { data: softened } = await sharp(original)
+    .ensureAlpha()
+    .blur(2)
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const mask = makeLetteringMask(source, softened, width, height, regions);
+  const cleaned = inpaintLettering(source, width, height, mask);
   const overlays = await Promise.all(
-    translatedRegions.map(async (region) => {
-      const x = Math.round(region.x * width);
-      const y = Math.round(region.y * height);
-      const w = Math.max(12, Math.round(region.width * width));
-      const h = Math.max(12, Math.round(region.height * height));
-      const box = {
-        left: clamp(x, 0, Math.max(0, width - 1)),
-        top: clamp(y, 0, Math.max(0, height - 1)),
-        width: Math.max(1, Math.min(w, width - clamp(x, 0, Math.max(0, width - 1)))),
-        height: Math.max(1, Math.min(h, height - clamp(y, 0, Math.max(0, height - 1)))),
-      };
-      const [cover, stats] = await Promise.all([
-        sharp(original)
-          .extract(box)
-          .blur(clamp(Math.min(box.width, box.height) * 0.08, 4, 24))
-          .png()
-          .toBuffer(),
-        sharp(original).extract(box).stats(),
-      ]);
-      coverInputs.push({ input: cover, left: box.left, top: box.top });
-
-      const average = stats.channels.slice(0, 3).reduce((sum, channel) => sum + channel.mean, 0) / 3;
+    regions.filter((region) => region.translatedText.trim()).map(async (region) => {
+      const box = regionBounds(region, width, height);
+      const average = (() => {
+        let total = 0;
+        let samples = 0;
+        for (let y = box.top; y < box.top + box.height; y += 1) {
+          for (let x = box.left; x < box.left + box.width; x += 1) {
+            const offset = (y * width + x) * 4;
+            total += luminance(source[offset], source[offset + 1], source[offset + 2]);
+            samples += 1;
+          }
+        }
+        return total / Math.max(1, samples);
+      })();
       const darkBackground = average < 115;
       const fontSize = clamp(
         region.fontSize * height || Math.min(box.height * 0.34, box.width * 0.12),
@@ -115,7 +261,7 @@ export async function renderTranslatedImage(
   );
 
   const buffer = await sharp(original)
-    .composite([...coverInputs, { input: svg }])
+    .composite([{ input: await sharp(cleaned, { raw: { width, height, channels: 4 } }).png().toBuffer() }, { input: svg }])
     .png({ compressionLevel: 9 })
     .toBuffer();
   return { buffer, width, height };
