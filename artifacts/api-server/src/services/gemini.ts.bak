@@ -33,16 +33,10 @@ export class GeminiServiceError extends Error {
 
 function publicGeminiError(error: unknown): GeminiServiceError {
   const message = error instanceof Error ? error.message.toLowerCase() : "";
-  const status =
-    typeof error === "object" && error !== null && "status" in error && typeof error.status === "number"
-      ? error.status
-      : undefined;
-  if (status === 429 || message.includes("429") || message.includes("quota") || message.includes("rate")) {
+  if (message.includes("429") || message.includes("quota") || message.includes("rate")) {
     return new GeminiServiceError("rate_limit", "Gemini usage limit reached");
   }
   if (
-    status === 401 ||
-    status === 403 ||
     message.includes("fetch") ||
     message.includes("timeout") ||
     message.includes("unavailable") ||
@@ -51,12 +45,6 @@ function publicGeminiError(error: unknown): GeminiServiceError {
     return new GeminiServiceError("unavailable", "Gemini service unavailable");
   }
   return new GeminiServiceError("unavailable", "Gemini request failed");
-}
-
-function requestModel(): string {
-  // Google currently rejects the dated 2.5 model for newly created API users,
-  // while this alias resolves to the current Gemini Flash model.
-  return TRANSLATION_MODEL === "gemini-2.5-flash" ? "gemini-flash-latest" : TRANSLATION_MODEL;
 }
 
 function promptFor(targetLanguage: string): string {
@@ -128,11 +116,10 @@ export async function analyzeImage(
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
   let lastError: unknown;
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    if (attempt > 0) await new Promise(r => setTimeout(r, attempt * 2000));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const response = await ai.models.generateContent({
-        model: requestModel(),
+        model: TRANSLATION_MODEL,
         contents: [
           {
             inlineData: {
@@ -151,7 +138,7 @@ export async function analyzeImage(
       return parseRegions(response.text ?? "[]");
     } catch (error) {
       lastError = error;
-      if (error instanceof z.ZodError || error instanceof SyntaxError || (error instanceof Error && (error.message.includes("503") || error.message.includes("unavailable") || error.message.includes("timeout") || error.message.includes("fetch")))) {
+      if (error instanceof z.ZodError || error instanceof SyntaxError) {
         continue;
       }
       throw publicGeminiError(error);
@@ -160,6 +147,6 @@ export async function analyzeImage(
 
   throw new GeminiServiceError(
     "malformed",
-    "Gemini returned invalid structured data",
+    lastError instanceof Error ? lastError.message : "Gemini returned invalid structured data",
   );
 }
