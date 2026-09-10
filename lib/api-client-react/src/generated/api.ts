@@ -62,7 +62,7 @@ export const getHealthCheckUrl = () => {
 
 
 
-  return `/api/healthz`
+  return `/backend/healthz`
 }
 
 /**
@@ -86,7 +86,7 @@ export const healthCheck = async ( options?: Parameters<typeof customFetch>[1]):
 
 export const getHealthCheckQueryKey = () => {
     return [
-    `/api/healthz`
+    `/backend/healthz`
     ] as const;
     }
 
@@ -140,7 +140,7 @@ export const getGetAppConfigUrl = () => {
 
 
 
-  return `/api/config`
+  return `/backend/config`
 }
 
 /**
@@ -163,7 +163,7 @@ export const getAppConfig = async ( options?: Parameters<typeof customFetch>[1])
 
 export const getGetAppConfigQueryKey = () => {
     return [
-    `/api/config`
+    `/backend/config`
     ] as const;
     }
 
@@ -217,7 +217,7 @@ export const getTranslateImageUrl = () => {
 
 
 
-  return `/api/translate/image`
+  return `/backend/translate/image`
 }
 
 /**
@@ -291,7 +291,7 @@ export const getTranslateChapterUrl = () => {
 
 
 
-  return `/api/translate/chapter`
+  return `/backend/translate/chapter`
 }
 
 /**
@@ -370,7 +370,7 @@ export const getTranslateChaptersUrl = () => {
 
 
 
-  return `/api/translate/chapters`
+  return `/backend/translate/chapters`
 }
 
 /**

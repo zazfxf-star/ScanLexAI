@@ -1,4 +1,3 @@
-import { GoogleGenAI, Modality } from "@google/genai";
 import sharp from "sharp";
 import type { TextRegion } from "./gemini";
 
@@ -9,6 +8,69 @@ function escapeXml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
+}
+
+function getLuminance(r: number, g: number, b: number): number {
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+/**
+ * خوارزمية ذكية لقراءة لون خلفية النص مع مطابقة الألوان النقية (الأبيض والأسود الصافي)
+ */
+async function getCleanBackgroundColor(
+  original: Buffer,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  imgW: number,
+  imgH: number,
+): Promise<{ bgColor: string; isLight: boolean }> {
+  try {
+    const safeX = Math.max(0, Math.min(x, imgW - 1));
+    const safeY = Math.max(0, Math.min(y, imgH - 1));
+    const safeW = Math.min(w, imgW - safeX);
+    const safeH = Math.min(h, imgH - safeY);
+
+    if (safeW < 4 || safeH < 4) return { bgColor: "#FFFFFF", isLight: true };
+
+    const sampleSize = Math.max(2, Math.min(8, Math.floor(Math.min(safeW, safeH) / 4)));
+
+    const cornerTL = await sharp(original)
+      .extract({ left: safeX, top: safeY, width: sampleSize, height: sampleSize })
+      .stats();
+
+    const cornerTR = await sharp(original)
+      .extract({ left: safeX + safeW - sampleSize, top: safeY, width: sampleSize, height: sampleSize })
+      .stats();
+
+    const cornerBL = await sharp(original)
+      .extract({ left: safeX, top: safeY + safeH - sampleSize, width: sampleSize, height: sampleSize })
+      .stats();
+
+    const cornerBR = await sharp(original)
+      .extract({ left: safeX + safeW - sampleSize, top: safeY + safeH - sampleSize, width: sampleSize, height: sampleSize })
+      .stats();
+
+    const r = Math.round((cornerTL.channels[0].mean + cornerTR.channels[0].mean + cornerBL.channels[0].mean + cornerBR.channels[0].mean) / 4);
+    const g = Math.round((cornerTL.channels[1].mean + cornerTR.channels[1].mean + cornerBL.channels[1].mean + cornerBR.channels[1].mean) / 4);
+    const b = Math.round((cornerTL.channels[2].mean + cornerTR.channels[2].mean + cornerBL.channels[2].mean + cornerBR.channels[2].mean) / 4);
+
+    const lum = getLuminance(r, g, b);
+
+    // توحيد درجات الأبيض والأسود النقي لمنع ظهور التدرجات الرمادية المزعجة
+    if (lum > 185) {
+      return { bgColor: "#FFFFFF", isLight: true };
+    }
+    if (lum < 45) {
+      return { bgColor: "#000000", isLight: false };
+    }
+
+    return { bgColor: `rgb(${r},${g},${b})`, isLight: lum >= 128 };
+  } catch {
+    // في حال أي خطأ، يفترض الكود أن الفقاعة بيضاء ناصعة
+    return { bgColor: "#FFFFFF", isLight: true };
+  }
 }
 
 function wrapText(text: string, maxChars: number): string[] {
@@ -29,77 +91,66 @@ function wrapText(text: string, maxChars: number): string[] {
   return lines;
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
+/**
+ * دالة لتوزيع النص وحساب أفضل حجم خط مناسب للسطور والارتفاع المتاح
+ */
+function fitText(
+  text: string,
+  w: number,
+  h: number,
+): { lines: string[]; fontSize: number; lineHeight: number; totalTextHeight: number } {
+  const cleanText = text.trim();
+  let bestFontSize = 12;
+  let bestLines: string[] = [cleanText];
 
-function containsArabic(text: string): boolean {
-  return /[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]/u.test(text);
-}
+  const maxFontSize = Math.min(Math.floor(h * 0.35), 32);
+  const minFontSize = 11;
 
-function luminance(red: number, green: number, blue: number): number {
-  return red * 0.2126 + green * 0.7152 + blue * 0.0722;
-}
+  for (let size = maxFontSize; size >= minFontSize; size -= 1) {
+    const avgCharWidth = size * 0.52;
+    const maxChars = Math.max(2, Math.floor((w * 0.92) / avgCharWidth));
+    const lines = wrapText(cleanText, maxChars);
+    const lineHeight = size * 1.25;
+    const totalHeight = lines.length * lineHeight;
 
-function regionBounds(region: TextRegion, width: number, height: number) {
-  const left = clamp(Math.round(region.x * width), 0, Math.max(0, width - 1));
-  const top = clamp(Math.round(region.y * height), 0, Math.max(0, height - 1));
+    if (totalHeight <= h * 0.92 || size === minFontSize) {
+      bestFontSize = size;
+      bestLines = lines;
+      break;
+    }
+  }
+
+  const lineHeight = bestFontSize * 1.25;
+  const totalTextHeight = bestLines.length * lineHeight;
+
   return {
-    left,
-    top,
-    width: Math.max(1, Math.min(Math.round(region.width * width), width - left)),
-    height: Math.max(1, Math.min(Math.round(region.height * height), height - top)),
+    lines: bestLines,
+    fontSize: bestFontSize,
+    lineHeight,
+    totalTextHeight,
   };
 }
 
-async function editTextRegion(
-  original: Buffer,
-  box: { left: number; top: number; width: number; height: number },
-): Promise<Buffer> {
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error("Gemini image editor is not configured");
+/**
+ * تنسيق النصوص وتلوين العلامات مثل <النظام> باللون الذهبي تلقائياً
+ */
+function buildFormattedTspan(
+  line: string,
+  textX: number,
+  yPos: number,
+  systemColor: string,
+): string {
+  const escaped = escapeXml(line);
+
+  if (escaped.includes("&lt;") && escaped.includes("&gt;")) {
+    const formatted = escaped.replace(
+      /(&lt;.*?&gt;)/g,
+      `<tspan fill="${systemColor}" font-weight="900">$1</tspan>`
+    );
+    return `<tspan x="${textX}" y="${yPos}">${formatted}</tspan>`;
   }
 
-  const crop = await sharp(original).extract(box).png().toBuffer();
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash-image",
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            inlineData: {
-              mimeType: "image/png",
-              data: crop.toString("base64"),
-            },
-          },
-          {
-            text: [
-              "Edit only this provided image crop.",
-              "Remove only the original lettering or text.",
-              "Reconstruct the exact background or artwork that was behind the removed lettering.",
-              "Do not add, translate, or generate any text.",
-              "Do not redraw or alter characters, faces, clothing, objects, borders, gradients, speech-bubble shapes, panels, or anything outside the original lettering.",
-              "Return only the cleaned crop at the same dimensions.",
-            ].join(" "),
-          },
-        ],
-      },
-    ],
-    config: { responseModalities: [Modality.IMAGE] },
-  });
-  const imagePart = response.candidates?.[0]?.content?.parts?.find(
-    (part) => part.inlineData?.data,
-  );
-  if (!imagePart?.inlineData?.data) {
-    throw new Error("Gemini image editor returned no cleaned region");
-  }
-
-  return sharp(Buffer.from(imagePart.inlineData.data, "base64"))
-    .resize(box.width, box.height, { fit: "fill" })
-    .png()
-    .toBuffer();
+  return `<tspan x="${textX}" y="${yPos}">${escaped}</tspan>`;
 }
 
 export async function renderTranslatedImage(
@@ -109,106 +160,69 @@ export async function renderTranslatedImage(
   const metadata = await sharp(original).metadata();
   const width = metadata.width ?? 1;
   const height = metadata.height ?? 1;
-  const translatedRegions = regions.filter((region) => region.translatedText.trim());
 
-  const cleanedRegions: { input: Buffer; left: number; top: number }[] = [];
-  for (const region of translatedRegions) {
-    const box = regionBounds(region, width, height);
-    cleanedRegions.push({
-      input: await editTextRegion(original, box),
-      left: box.left,
-      top: box.top,
-    });
-  }
+  const overlays: string[] = [];
 
-  const { data: source } = await sharp(original)
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  const overlays = translatedRegions.map((region) => {
-    const box = regionBounds(region, width, height);
-    let averageLuminance = 0;
-    let samples = 0;
-    for (let y = box.top; y < box.top + box.height; y += 1) {
-      for (let x = box.left; x < box.left + box.width; x += 1) {
-        const offset = (y * width + x) * 4;
-        averageLuminance += luminance(
-          source[offset],
-          source[offset + 1],
-          source[offset + 2],
-        );
-        samples += 1;
-      }
-    }
-    const darkBackground = averageLuminance / Math.max(1, samples) < 115;
-    const fontSize = clamp(
-      region.fontSize * height || Math.min(box.height * 0.34, box.width * 0.12),
-      12,
-      Math.min(box.height * 0.34, box.width * 0.16),
-    );
-    let fittedFontSize = fontSize;
-    let lines = wrapText(
-      region.translatedText,
-      Math.max(
-        3,
-        Math.floor(
-          box.width /
-            (fittedFontSize * (containsArabic(region.translatedText) ? 0.7 : 0.62)),
-        ),
-      ),
-    );
-    while (
-      fittedFontSize > 12 &&
-      lines.length * fittedFontSize * 1.18 > box.height * 0.86
-    ) {
-      fittedFontSize -= 1;
-      lines = wrapText(
-        region.translatedText,
-        Math.max(
-          3,
-          Math.floor(
-            box.width /
-              (fittedFontSize *
-                (containsArabic(region.translatedText) ? 0.7 : 0.62)),
-          ),
-        ),
-      );
-    }
-    const lineHeight = fittedFontSize * 1.18;
-    const totalTextHeight = lines.length * lineHeight;
-    const firstBaseline =
-      box.top + (box.height - totalTextHeight) / 2 + fittedFontSize;
-    const rtl = containsArabic(region.translatedText);
-    const anchor =
-      region.align === "left"
-        ? "start"
-        : region.align === "right"
-          ? "end"
-          : "middle";
-    const textX =
-      region.align === "left"
-        ? box.left + fittedFontSize * 0.7
-        : region.align === "right"
-          ? box.left + box.width - fittedFontSize * 0.7
-          : box.left + box.width / 2;
-    const textLines = lines
-      .map(
-        (line, index) =>
-          `<tspan x="${textX}" y="${firstBaseline + index * lineHeight}">${escapeXml(line)}</tspan>`,
-      )
+  for (const region of regions) {
+    if (!region.translatedText.trim()) continue;
+
+    const rawX = Math.round(region.x * width);
+    const rawY = Math.round(region.y * height);
+    const rawW = Math.round(region.width * width);
+    const rawH = Math.round(region.height * height);
+
+    // توسيع هامش التغطية بمقدار بسيط لضمان مسح النص الأصلي بالكامل
+    const pad = 2;
+    const x = Math.max(0, rawX - pad);
+    const y = Math.max(0, rawY - pad);
+    const w = Math.min(width - x, Math.max(12, rawW + pad * 2));
+    const h = Math.min(height - y, Math.max(12, rawH + pad * 2));
+
+    // 1. تحديد لون الخلفية بدقة ومعرفة إن كانت فاتحة أم مظلمة
+    const { bgColor, isLight } = await getCleanBackgroundColor(original, x, y, w, h, width, height);
+
+    // تحديد ألوان النص والحدود لتتناسب مع طبيعة الفقاعة
+    const textColor = isLight ? "#0A0A0A" : "#FFFFFF";
+    const strokeColor = isLight ? "#FFFFFF" : "#000000";
+    const systemTagColor = isLight ? "#D97706" : "#FFE600";
+
+    // 2. حساب حجم الخط والتفاف الأسطر
+    const { lines, fontSize, lineHeight, totalTextHeight } = fitText(region.translatedText, w, h);
+
+    const textX = x + w / 2;
+    const firstBaseline = y + (h - totalTextHeight) / 2 + fontSize * 0.82;
+
+    const strokeLines = lines
+      .map((line, index) => `<tspan x="${textX}" y="${firstBaseline + index * lineHeight}">${escapeXml(line)}</tspan>`)
       .join("");
-    const textColor = darkBackground ? "#fffdf5" : "#10161c";
-    const outlineColor = darkBackground ? "#10161c" : "#fffdf5";
-    const outlineWidth = clamp(fittedFontSize * 0.055, 1.2, 3.2);
-    return `<text x="${textX}" y="${firstBaseline}" text-anchor="${anchor}" font-family="Noto Sans Arabic, Amiri, Cairo, DejaVu Sans, sans-serif" font-size="${fittedFontSize}" font-weight="700" fill="${textColor}" stroke="${outlineColor}" stroke-width="${outlineWidth}" stroke-opacity="0.88" paint-order="stroke fill" direction="${rtl ? "rtl" : "ltr"}" unicode-bidi="plaintext">${textLines}</text>`;
-  });
+
+    const fillLines = lines
+      .map((line, index) => buildFormattedTspan(line, textX, firstBaseline + index * lineHeight, systemTagColor))
+      .join("");
+
+    const strokeWidth = Math.max(2, Math.round(fontSize * 0.14));
+    const borderRadius = Math.min(16, Math.min(w, h) * 0.25);
+
+    overlays.push(`
+      <!-- 1. تنظيف وتغطية النص القديم بحواف انسيابية تناسب الفقاعات -->
+      <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${borderRadius}" ry="${borderRadius}" fill="${bgColor}" />
+
+      <!-- 2. حدود الخط الخارجي لضمان عدم تداخل النص مع الحواف -->
+      <text x="${textX}" y="${firstBaseline}" text-anchor="middle" font-family="'Cairo', 'Tajawal', 'Almarai', 'Arial', sans-serif" font-size="${fontSize}" font-weight="800" fill="none" stroke="${strokeColor}" stroke-width="${strokeWidth}" stroke-linejoin="round" direction="rtl" unicode-bidi="plaintext">${strokeLines}</text>
+
+      <!-- 3. النص العربي (أسود للفقاعات البيضاء / أبيض للفقاعات المظلمة) -->
+      <text x="${textX}" y="${firstBaseline}" text-anchor="middle" font-family="'Cairo', 'Tajawal', 'Almarai', 'Arial', sans-serif" font-size="${fontSize}" font-weight="800" fill="${textColor}" direction="rtl" unicode-bidi="plaintext">${fillLines}</text>
+    `);
+  }
 
   const svg = Buffer.from(
     `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">${overlays.join("")}</svg>`,
   );
+
   const buffer = await sharp(original)
-    .composite([...cleanedRegions, { input: svg }])
+    .composite([{ input: svg }])
     .png({ compressionLevel: 9 })
     .toBuffer();
+
   return { buffer, width, height };
 }

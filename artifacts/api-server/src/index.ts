@@ -1,25 +1,22 @@
-import app from "./app";
-import { logger } from "./lib/logger";
+import express from "express";
+import cors from "cors";
+import translationRoutes from "./routes/translation";
 
-const rawPort = process.env["PORT"];
+const app = express();
 
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided.",
-  );
-}
+// إعطاء منفذ افتراضي 3001 إذا لم يتم التحديد لعدم إيقاف السيرفر
+const PORT = process.env.PORT || 3001;
 
-const port = Number(rawPort);
+app.use(cors());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-if (Number.isNaN(port) || port <= 0) {
-  throw new Error(`Invalid PORT value: "${rawPort}"`);
-}
+app.use("/backend", translationRoutes);
 
-app.listen(port, (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
-  }
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
 
-  logger.info({ port }, "Server listening");
+app.listen(PORT, () => {
+  console.log(`API Server is running on port ${PORT}`);
 });

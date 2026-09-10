@@ -48,7 +48,7 @@ app.use((error: unknown, _req: express.Request, res: express.Response, _next: ex
   }
   if (isValidation || error instanceof Error) {
     res.status(isValidation ? 400 : 500).json({
-      error: isValidation ? error.message : "حدث خطأ غير متوقع. حاول مرة أخرى.",
+      error: isValidation ? error.message : (error instanceof Error ? error.message : String(error)),
     });
     return;
   }

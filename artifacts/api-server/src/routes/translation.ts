@@ -1,7 +1,7 @@
 import { Router, type IRouter, type RequestHandler } from "express";
 import multer from "multer";
-import * as archiver from "archiver";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   MAX_CHAPTER_BYTES,
   MAX_IMAGE_BYTES,
@@ -10,22 +10,27 @@ import {
   supportedLanguages,
 } from "../config";
 import { extractChapter } from "../services/archive";
-import { GeminiServiceError } from "../services/gemini";
-import { canUseThreeChapterMode, getStoredFile, translatePage } from "../services/pipeline";
-import { randomUUID } from "node:crypto";
+import {
+  getAllStoredPages,
+  saveStoredFile,
+  translatePage,
+} from "../services/pipeline";
 
 const router: IRouter = Router();
+
 const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_IMAGE_BYTES, files: 1 },
 });
+
 const chapterUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_CHAPTER_BYTES, files: 51 },
 });
 
-const asyncRoute = (handler: RequestHandler): RequestHandler => (req, res, next) =>
-  Promise.resolve(handler(req, res, next)).catch(next);
+const asyncRoute = (handler: RequestHandler): RequestHandler =>
+  (req, res, next) =>
+    Promise.resolve(handler(req, res, next)).catch(next);
 
 function requireLanguage(value: unknown): string {
   const language = typeof value === "string" ? value : "";
@@ -57,6 +62,24 @@ function ensureImage(file: Express.Multer.File | undefined): Express.Multer.File
   return file;
 }
 
+function normalizeTranslationResult(rawResult: any, fileBuffer: Buffer, mimeType: string) {
+  const result = (rawResult && typeof rawResult === "object" && "data" in rawResult)
+    ? rawResult.data
+    : rawResult;
+
+  const originalImageBase64 = `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
+  let translatedImage = result?.translatedImage || originalImageBase64;
+
+  return {
+    ...result,
+    originalImage: originalImageBase64,
+    translatedImage,
+    width: result?.width || 0,
+    height: result?.height || 0,
+    regions: Array.isArray(result?.regions) ? result.regions : [],
+  };
+}
+
 router.get("/config", (_req, res) => {
   res.json({
     serviceConfigured: Boolean(process.env.GEMINI_API_KEY),
@@ -73,8 +96,21 @@ router.post(
   asyncRoute(async (req, res) => {
     const file = ensureImage(req.file);
     const targetLanguage = requireLanguage(req.body.targetLanguage);
-    const result = await translatePage(file.buffer, file.mimetype, targetLanguage);
-    res.json({ id: result.originalImage.split("/")[3], ...result, targetLanguage, model: TRANSLATION_MODEL });
+
+    const rawResult = await translatePage(file.buffer, file.mimetype, targetLanguage);
+    const normalized = normalizeTranslationResult(rawResult, file.buffer, file.mimetype);
+    const resultId = randomUUID();
+
+    if (rawResult.translatedBuffer) {
+      saveStoredFile(resultId, "translated", rawResult.translatedBuffer, "image/png");
+    }
+
+    res.json({
+      id: resultId,
+      ...normalized,
+      targetLanguage,
+      model: TRANSLATION_MODEL,
+    });
   }),
 );
 
@@ -88,107 +124,115 @@ router.post(
     const fields = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
     const archive = fields.file?.[0];
     const images = fields.images ?? [];
+
     if (!archive && !images.length) {
       const error = new Error("لم يتم اختيار ملف فصل.");
       error.name = "ValidationError";
       throw error;
     }
+
     const targetLanguage = requireLanguage(req.body.targetLanguage);
     const source = archive ?? images[0];
-    const pages = await extractChapter(
-      archive ?? images[0],
-      archive ? images : images.slice(1),
-    );
+
+    const pages = await extractChapter(archive ?? images[0], archive ? images : images.slice(1));
     const resultId = randomUUID();
-    const translatedPages = [];
-    for (let index = 0; index < pages.length; index += 1) {
-      const page = pages[index];
-      translatedPages.push(
-        await translatePage(page.buffer, page.mimeType, targetLanguage, resultId, index + 1),
+    const chapterName = source.originalname.replace(/\.(zip|cbz)$/i, "");
+
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "no-cache");
+    res.status(200);
+
+    res.write(
+      `{\n"id": ${JSON.stringify(resultId)},\n"name": ${JSON.stringify(chapterName)},\n"pageCount": ${pages.length},\n"targetLanguage": ${JSON.stringify(targetLanguage)},\n"model": ${JSON.stringify(TRANSLATION_MODEL)},\n"pages": [\n`
+    );
+
+    // تم التعديل إلى 4 لتطابق عدد مفاتيح الـ API وتمنع سقوط الصفحات
+    const BATCH_SIZE = 4;
+
+    for (let i = 0; i < pages.length; i += BATCH_SIZE) {
+      const batch = pages.slice(i, i + BATCH_SIZE);
+
+      const batchResults = await Promise.all(
+        batch.map(async (page, batchIdx) => {
+          const globalIdx = i + batchIdx;
+          let rawResult: any = null;
+          try {
+            const __t0 = Date.now(); 
+            rawResult = await translatePage(page.buffer, page.mimeType, targetLanguage); 
+            console.log(`[Timing] Page ${globalIdx + 1} took ${Date.now() - __t0}ms`);
+          } catch (err) {
+            console.error(`[ScanLex Error] فشلت ترجمة الصفحة ${globalIdx + 1}:`, err);
+          }
+
+          const normalized = normalizeTranslationResult(rawResult, page.buffer, page.mimeType);
+
+          if (rawResult?.translatedBuffer) {
+            saveStoredFile(
+              resultId,
+              `page-${globalIdx + 1}-translated`,
+              rawResult.translatedBuffer,
+              "image/png"
+            );
+          }
+
+          page.buffer = Buffer.alloc(0);
+
+          return {
+            pageNumber: globalIdx + 1,
+            ...normalized,
+          };
+        })
       );
-    }
-    res.json({
-      id: resultId,
-      name: source.originalname.replace(/\.(zip|cbz)$/i, ""),
-      pageCount: translatedPages.length,
-      pages: translatedPages,
-      targetLanguage,
-      model: TRANSLATION_MODEL,
-    });
-  }),
-);
 
-router.post(
-  "/translate/chapters",
-  chapterUpload.array("files", 3),
-  asyncRoute(async (req, res) => {
-    if (!canUseThreeChapterMode()) {
-      const error = new Error("Three chapter mode is unavailable");
-      error.name = "ValidationError";
-      throw error;
-    }
-    const files = (req.files ?? []) as Express.Multer.File[];
-    if (!files.length || files.length > 3) {
-      const error = new Error("اختر من فصل واحد إلى ثلاثة فصول.");
-      error.name = "ValidationError";
-      throw error;
-    }
-    const targetLanguage = requireLanguage(req.body.targetLanguage);
-    const chapters = [];
-    for (const file of files) {
-      const pages = await extractChapter(file, []);
-      const resultId = randomUUID();
-      const translatedPages = [];
-      for (let index = 0; index < pages.length; index += 1) {
-        const page = pages[index];
-        translatedPages.push(
-          await translatePage(page.buffer, page.mimeType, targetLanguage, resultId, index + 1),
-        );
+      for (let b = 0; b < batchResults.length; b += 1) {
+        const pageData = batchResults[b];
+        const isLast = i + b === pages.length - 1;
+        res.write(JSON.stringify(pageData) + (isLast ? "" : ",\n"));
       }
-      chapters.push({
-        id: resultId,
-        name: file.originalname.replace(/\.(zip|cbz)$/i, ""),
-        pageCount: translatedPages.length,
-        pages: translatedPages,
-        targetLanguage,
-        model: TRANSLATION_MODEL,
-      });
+
+      // استراحة 800 ملي ثانية بين كل دفعة عشان نتفادى الـ Rate Limit حق جوجل
+      if (i + BATCH_SIZE < pages.length) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
     }
-    res.json({ id: randomUUID(), chapterCount: chapters.length, chapters, targetLanguage });
+
+    res.write("\n]\n}");
+    res.end();
   }),
 );
 
-router.get("/files/:resultId/chapter.zip", asyncRoute(async (req, res) => {
-  const resultId = String(req.params.resultId);
-  const result = getStoredFile(resultId, "page-1-translated");
-  if (!result) {
-    res.status(404).json({ error: "Chapter not found or expired." });
-    return;
-  }
-  res.attachment("scanlex-translated-chapter.zip");
-  const archive = new archiver.ZipArchive({ zlib: { level: 9 } });
-  archive.on("error", (error: Error) => {
-    if (!res.headersSent) res.status(500).json({ error: "Unable to create chapter download." });
-  });
-  archive.pipe(res);
-  for (let pageNumber = 1; pageNumber <= 60; pageNumber += 1) {
-    const page = getStoredFile(resultId, `page-${pageNumber}-translated`);
-    if (!page) break;
-    archive.file(page.path, { name: `page-${String(pageNumber).padStart(3, "0")}.png` });
-  }
-  await archive.finalize();
-}));
+router.get(
+  ["/files/:resultId/chapter.cbz", "/files/:resultId/chapter.zip"],
+  asyncRoute(async (req, res) => {
+    const resultId = String(req.params.resultId);
+    const pages = getAllStoredPages(resultId);
 
-router.get("/files/:resultId/:fileKey", asyncRoute(async (req, res) => {
-  const resultId = String(req.params.resultId);
-  const fileKey = String(req.params.fileKey);
-  const stored = getStoredFile(resultId, fileKey);
-  if (!stored) {
-    res.status(404).json({ error: "Result file not found or expired." });
-    return;
-  }
-  res.type(stored.contentType);
-  res.sendFile(stored.path);
-}));
+    if (!pages || pages.length === 0) {
+      res.status(404).json({ error: "Chapter not found or expired." });
+      return;
+    }
+
+    try {
+      const JSZipModule = await import("jszip");
+      const JSZip = JSZipModule.default || JSZipModule;
+      const zip = new JSZip();
+
+      pages.forEach((p, idx) => {
+        const pageNum = String(idx + 1).padStart(3, "0");
+        zip.file(`page_${pageNum}.png`, p.buffer);
+      });
+
+      const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+
+      res.setHeader("Content-Type", "application/x-cbz");
+      res.setHeader("Content-Disposition", `attachment; filename="scanlex-translated-${resultId.slice(0, 8)}.cbz"`);
+      res.send(zipBuffer);
+    } catch (err) {
+      console.error("[ScanLex Download Error]", err);
+      res.status(500).json({ error: "Zip module is loading, please retry in a few seconds." });
+    }
+  }),
+);
 
 export default router;
