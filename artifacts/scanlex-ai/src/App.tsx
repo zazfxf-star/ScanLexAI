@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { createContext, useContext, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
@@ -98,6 +98,20 @@ type MultiResult = {
 };
 
 type Result = ImageResult | ChapterResult | MultiResult;
+
+type AppShellContextValue = {
+  settingsOpen: boolean;
+  openSettings: () => void;
+  closeSettings: () => void;
+};
+
+const AppShellContext = createContext<AppShellContextValue | null>(null);
+
+function useAppShell() {
+  const context = useContext(AppShellContext);
+  if (!context) throw new Error('useAppShell must be used inside AppShell');
+  return context;
+}
 
 const fallbackLanguages: Language[] = [
   { code: 'ar', label: 'Arabic', nativeLabel: 'العربية', direction: 'rtl' },
@@ -328,10 +342,21 @@ function LogoMark({ compact = false }: { compact?: boolean }) {
 
 function AppShell({ children }: { children: React.ReactNode }) {
   const [navOpen, setNavOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const shellContext = {
+    settingsOpen,
+    openSettings: () => {
+      setSettingsOpen(true);
+      setNavOpen(false);
+    },
+    closeSettings: () => setSettingsOpen(false),
+  };
 
   return (
-    <div className="min-h-[100dvh] bg-transparent text-foreground">
-      <header className="sticky top-0 z-30 flex h-[68px] items-center justify-between border-b border-border/80 bg-transparent px-5 backdrop-blur md:hidden">
+    <AppShellContext.Provider value={shellContext}>
+      <div className="min-h-[100dvh] bg-transparent text-foreground">
+      <header className="sticky top-0 z-30 flex h-[68px] items-center justify-between border-b border-border/80 bg-[#11171b] px-5 md:hidden">
         <LogoMark />
         <button
           type="button"
@@ -344,8 +369,16 @@ function AppShell({ children }: { children: React.ReactNode }) {
         </button>
       </header>
 
+      {navOpen && (
+        <div
+          className="fixed inset-0 top-[68px] z-10 bg-[#0d1317] md:hidden"
+          onClick={() => setNavOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
       <aside
-        className={`fixed inset-x-0 top-[68px] z-20 border-b border-border bg-sidebar px-5 py-4 transition-transform md:inset-y-0 md:left-0 md:top-0 md:block md:w-[238px] md:translate-x-0 md:border-b-0 md:border-r md:px-4 md:py-5 ${
+        className={`isolate fixed inset-x-0 top-[68px] z-20 border-b border-border bg-[#11171b] px-5 py-4 shadow-[0_18px_40px_rgba(0,0,0,0.35)] transition-transform md:inset-y-0 md:left-0 md:top-0 md:block md:w-[238px] md:translate-x-0 md:border-b-0 md:border-r md:px-4 md:py-5 ${
           navOpen ? 'translate-y-0' : '-translate-y-[130%] md:translate-y-0'
         }`}
       >
@@ -356,7 +389,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
 
           <button
             type="button"
-            className="focus-ring flex w-full items-center gap-3 rounded-xl bg-primary/10 px-3 py-2.5 text-left text-sm font-semibold text-primary"
+            className="focus-ring flex w-full items-center gap-3 rounded-xl bg-[#17383f] px-3 py-2.5 text-left text-sm font-semibold text-primary"
             onClick={() => setNavOpen(false)}
             data-testid="button-nav-workspace"
           >
@@ -366,7 +399,7 @@ function AppShell({ children }: { children: React.ReactNode }) {
 
           <button
             type="button"
-            className="focus-ring flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-muted-foreground transition hover:bg-secondary hover:text-foreground"
+            className="focus-ring flex w-full items-center gap-3 rounded-xl bg-[#11171b] px-3 py-2.5 text-left text-sm text-muted-foreground transition hover:bg-[#1b292e] hover:text-foreground"
             onClick={() => setNavOpen(false)}
             data-testid="button-nav-guide"
           >
@@ -379,8 +412,8 @@ function AppShell({ children }: { children: React.ReactNode }) {
 
           <button
             type="button"
-            className="focus-ring flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-muted-foreground transition hover:bg-secondary hover:text-foreground"
-            onClick={() => setNavOpen(false)}
+            className="focus-ring flex w-full items-center gap-3 rounded-xl bg-[#11171b] px-3 py-2.5 text-left text-sm text-muted-foreground transition hover:bg-[#1b292e] hover:text-foreground"
+            onClick={shellContext.openSettings}
             data-testid="button-nav-settings"
           >
             <Settings2 size={17} />
@@ -399,8 +432,9 @@ function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      <main className="md:pl-[238px]">{children}</main>
-    </div>
+        <main className="md:pl-[238px]">{children}</main>
+      </div>
+    </AppShellContext.Provider>
   );
 }
 
@@ -496,6 +530,103 @@ function LanguageSelect({
           : 'Text placement and reading order will be preserved.'}
       </span>
     </label>
+  );
+}
+
+function SettingsPanel({
+  languages,
+  language,
+  setLanguage,
+  disabled,
+  onClose,
+}: {
+  languages: Language[];
+  language: string;
+  setLanguage: (value: string) => void;
+  disabled: boolean;
+  onClose: () => void;
+}) {
+  const selected = languages.find((item) => item.code === language) ?? languages[0];
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center bg-[#080d10]/90 p-4 pt-[84px] sm:items-center sm:pt-4"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="w-full max-w-[480px] overflow-hidden rounded-2xl border border-border bg-[#11171b] shadow-[0_26px_80px_rgba(0,0,0,0.55)]"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
+        data-testid="panel-settings"
+      >
+        <div className="flex items-start justify-between border-b border-border bg-[#11171b] px-5 py-4">
+          <div>
+            <p className="font-mono text-[9px] uppercase tracking-[0.2em] text-primary">Preferences</p>
+            <h2 id="settings-title" className="mt-1 text-lg font-extrabold tracking-[-0.03em]">Settings</h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="focus-ring rounded-lg bg-[#1b292e] p-2 text-muted-foreground transition hover:text-foreground"
+            aria-label="Close settings"
+            data-testid="button-close-settings"
+          >
+            <X size={17} />
+          </button>
+        </div>
+
+        <div className="space-y-5 bg-[#11171b] p-5">
+          <div>
+            <h3 className="text-sm font-bold">Translation target language</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              Choose any language supported by the translation service. This selection is used for new translations.
+            </p>
+          </div>
+
+          <label className="block">
+            <span className="mb-2 block font-mono text-[9px] uppercase tracking-[0.18em] text-muted-foreground">
+              Target language
+            </span>
+            <select
+              value={language}
+              onChange={(event) => setLanguage(event.target.value)}
+              disabled={disabled || !languages.length}
+              className="focus-ring w-full appearance-none rounded-xl border border-border bg-[#1b292e] px-3.5 py-3 text-sm font-semibold text-foreground outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              data-testid="select-settings-language"
+            >
+              {languages.map((item) => (
+                <option key={item.code} value={item.code} className="bg-[#11171b] text-foreground">
+                  {item.label} · {item.nativeLabel}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <div className="rounded-xl border border-primary/25 bg-[#163139] px-3.5 py-3">
+            <div className="flex items-center gap-2 text-xs font-bold text-primary">
+              <Languages size={15} />
+              {selected ? `${selected.label} · ${selected.nativeLabel}` : 'Choose a language'}
+            </div>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+              The main translation form is synchronized with this setting.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="focus-ring flex h-11 w-full items-center justify-center rounded-xl bg-primary px-4 text-sm font-extrabold text-primary-foreground transition hover:brightness-110"
+            data-testid="button-done-settings"
+          >
+            Done
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -945,6 +1076,7 @@ function ChapterResultView({ result, isMulti }: { result: ChapterResult | MultiR
 }
 
 function Workspace() {
+  const { settingsOpen, closeSettings } = useAppShell();
   const configQuery = useGetAppConfig({ query: { queryKey: ['/api/config'] } });
   const translateImage = useTranslateImage();
   const translateChapters = useTranslateChapters();
@@ -1041,7 +1173,8 @@ function Workspace() {
   };
 
   return (
-    <div className="mx-auto max-w-[1180px] px-5 pb-16 pt-7 sm:px-8 md:px-10 md:pt-10">
+    <>
+      <div className="mx-auto max-w-[1180px] px-5 pb-16 pt-7 sm:px-8 md:px-10 md:pt-10">
       <div className="animate-rise flex items-start justify-between gap-4">
         <div>
           <div className="mb-2 flex items-center gap-2 font-mono text-[9px] uppercase tracking-[0.2em] text-primary">
@@ -1242,7 +1375,17 @@ function Workspace() {
           MODEL STATUS <span className="text-primary">●</span> {selectedLanguage?.label ?? 'Arabic'} ready
         </span>
       </footer>
-    </div>
+      </div>
+      {settingsOpen && (
+        <SettingsPanel
+          languages={languages}
+          language={language}
+          setLanguage={setLanguage}
+          disabled={isPending}
+          onClose={closeSettings}
+        />
+      )}
+    </>
   );
 }
 
