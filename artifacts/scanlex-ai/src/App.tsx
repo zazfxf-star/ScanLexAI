@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
@@ -210,11 +210,27 @@ type ChapterProgress = {
   total: number;
 };
 
-async function translateChapterWithProgress(
+type ChapterJobStatus = {
+  jobId: string;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  name: string;
+  targetLanguage: string;
+  totalPages: number | null;
+  completedPages: number;
+  succeededPages: number[];
+  failedPages: number[];
+  complete: boolean;
+  resultId: string | null;
+  result: ChapterResult | null;
+  error: string | null;
+};
+
+const chapterJobStorageKey = 'scanlex:chapter-job';
+
+async function startChapterJob(
   files: File[],
   targetLanguage: string,
-  onProgress: (progress: ChapterProgress) => void,
-): Promise<ChapterResult> {
+): Promise<{ jobId: string; targetLanguage: string }> {
   const formData = new FormData();
   if (files.length === 1 && /\.(zip|cbz)$/i.test(files[0].name)) {
     formData.append('file', files[0]);
@@ -246,81 +262,56 @@ async function translateChapterWithProgress(
     throw error;
   }
 
-  const reader = response.body?.getReader();
-  if (!reader) {
-    return requireChapterResult(await response.json()) as ChapterResult;
+  const payload = await response.json() as { jobId?: string; targetLanguage?: string };
+  if (!payload.jobId) {
+    throw new Error('The chapter job could not be started.');
   }
-
-  const decoder = new TextDecoder();
-  let responseText = '';
-  let scanIndex = 0;
-  let pageCount = 0;
-  let pagesRead = 0;
-  let pagesStarted = false;
-  let done = false;
-
-  const readPageObjects = () => {
-    const pageMarker = '"pages": [';
-    if (!pagesStarted) {
-      const markerIndex = responseText.indexOf(pageMarker);
-      if (markerIndex < 0) return;
-      pagesStarted = true;
-      scanIndex = markerIndex + pageMarker.length;
-    }
-
-    const countMatch = responseText.match(/"pageCount"\s*:\s*(\d+)/);
-    if (countMatch) pageCount = Number(countMatch[1]);
-
-    while (scanIndex < responseText.length) {
-      while (responseText[scanIndex] === ',' || /\s/.test(responseText[scanIndex] ?? '')) scanIndex += 1;
-      if (responseText[scanIndex] !== '{') return;
-
-      let depth = 0;
-      let inString = false;
-      let escaped = false;
-      let endIndex = -1;
-      for (let index = scanIndex; index < responseText.length; index += 1) {
-        const character = responseText[index];
-        if (inString) {
-          if (escaped) escaped = false;
-          else if (character === '\\') escaped = true;
-          else if (character === '"') inString = false;
-          continue;
-        }
-        if (character === '"') {
-          inString = true;
-        } else if (character === '{') {
-          depth += 1;
-        } else if (character === '}') {
-          depth -= 1;
-          if (depth === 0) {
-            endIndex = index + 1;
-            break;
-          }
-        }
-      }
-      if (endIndex < 0) return;
-
-      try {
-        JSON.parse(responseText.slice(scanIndex, endIndex));
-      } catch {
-        return;
-      }
-      pagesRead += 1;
-      onProgress({ current: pagesRead, total: pageCount || pagesRead });
-      scanIndex = endIndex;
-    }
+  return {
+    jobId: payload.jobId,
+    targetLanguage: payload.targetLanguage || targetLanguage,
   };
+}
 
-  while (!done) {
-    const chunk = await reader.read();
-    done = chunk.done;
-    responseText += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !done });
-    readPageObjects();
+async function fetchChapterJobStatus(jobId: string): Promise<ChapterJobStatus> {
+  const response = await fetch(`/backend/translate/chapter/${jobId}/status`);
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
   }
-  responseText += decoder.decode();
-  readPageObjects();
-  return requireChapterResult(JSON.parse(responseText)) as ChapterResult;
+
+  if (!response.ok) {
+    const error = new Error(
+      payload && typeof payload === 'object' && 'error' in payload && typeof payload.error === 'string'
+        ? payload.error
+        : `HTTP ${response.status} ${response.statusText}`,
+    ) as Error & { status?: number; data?: unknown };
+    error.status = response.status;
+    error.data = payload;
+    throw error;
+  }
+  return payload as ChapterJobStatus;
+}
+
+async function pollChapterJob(
+  jobId: string,
+  onProgress: (progress: ChapterProgress) => void,
+  isActive: () => boolean = () => true,
+): Promise<ChapterJobStatus> {
+  let lastStatus: ChapterJobStatus | null = null;
+  while (isActive()) {
+    const status = await fetchChapterJobStatus(jobId);
+    lastStatus = status;
+    onProgress({
+      current: status.completedPages,
+      total: status.totalPages ?? Math.max(status.completedPages, 1),
+    });
+
+    if (status.complete) return status;
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+  }
+  return lastStatus as ChapterJobStatus;
 }
 
 function LogoMark({ compact = false }: { compact?: boolean }) {
@@ -1089,6 +1080,7 @@ function Workspace() {
   const [error, setError] = useState('');
   const [chapterProgress, setChapterProgress] = useState<ChapterProgress | null>(null);
   const [chapterStreamPending, setChapterStreamPending] = useState(false);
+  const chapterPollRef = useRef<string | null>(null);
 
   const languages = configQuery.data?.supportedLanguages?.length
     ? configQuery.data.supportedLanguages
@@ -1103,6 +1095,55 @@ function Workspace() {
     () => languages.find((item) => item.code === language) ?? languages[0] ?? fallbackLanguages[0],
     [language, languages],
   );
+
+  const trackChapterJob = (jobId: string, targetLanguage: string) => {
+    chapterPollRef.current = jobId;
+    setMode('chapter');
+    setLanguage(targetLanguage);
+    setChapterStreamPending(true);
+
+    return pollChapterJob(jobId, setChapterProgress, () => chapterPollRef.current === jobId)
+      .then((status) => {
+        if (chapterPollRef.current !== jobId) return;
+        if (status.status !== 'completed' || !status.result) {
+          throw new Error(status.error || 'The chapter job did not complete successfully.');
+        }
+        setResult(status.result);
+        setError('');
+      })
+      .catch((cause) => {
+        if (chapterPollRef.current !== jobId) return;
+        setError(friendlyError(cause, 'The chapter could not be completed.'));
+        window.localStorage.removeItem(chapterJobStorageKey);
+      })
+      .finally(() => {
+        if (chapterPollRef.current === jobId) {
+          setChapterStreamPending(false);
+        }
+      });
+  };
+
+  useEffect(() => {
+    const savedJob = window.localStorage.getItem(chapterJobStorageKey);
+    if (!savedJob) return;
+
+    try {
+      const parsed = JSON.parse(savedJob) as {
+        jobId?: string;
+        targetLanguage?: string;
+      };
+      if (parsed.jobId && parsed.targetLanguage) {
+        setChapterProgress({ current: 0, total: 0 });
+        trackChapterJob(parsed.jobId, parsed.targetLanguage);
+      }
+    } catch {
+      window.localStorage.removeItem(chapterJobStorageKey);
+    }
+
+    return () => {
+      chapterPollRef.current = null;
+    };
+  }, []);
 
   const submit = () => {
     if (!files.length || isPending) return;
@@ -1128,10 +1169,22 @@ function Workspace() {
       );
     } else if (mode === 'chapter') {
       setChapterStreamPending(true);
-      void translateChapterWithProgress(files, language, setChapterProgress)
-        .then((value) => setResult(requireChapterResult(value)))
-        .catch((cause) => setError(friendlyError(cause, 'The chapter could not be translated.')))
-        .finally(() => setChapterStreamPending(false));
+      void startChapterJob(files, language)
+        .then(({ jobId, targetLanguage }) => {
+          window.localStorage.setItem(
+            chapterJobStorageKey,
+            JSON.stringify({
+              jobId,
+              targetLanguage,
+              name: files[0]?.name || 'chapter',
+            }),
+          );
+          return trackChapterJob(jobId, targetLanguage);
+        })
+        .catch((cause) => {
+          setError(friendlyError(cause, 'The chapter could not be translated.'));
+          setChapterStreamPending(false);
+        });
     } else {
       translateChapters.mutate(
         { data: { files, targetLanguage: language } },
@@ -1162,6 +1215,8 @@ function Workspace() {
     setError('');
     setChapterProgress(null);
     setChapterStreamPending(false);
+    chapterPollRef.current = null;
+    window.localStorage.removeItem(chapterJobStorageKey);
   };
 
   const modeChange = (nextMode: Mode) => {

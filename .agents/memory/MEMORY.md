@@ -1,1 +1,2 @@
 - [Workflow ownership](workflow-ownership.md) — verify active port owners before restarting; finished artifact workflow records may remain after cleanup.
+- [Chapter job lifetime](chapter-job-lifetime.md) — background chapter jobs survive browser disconnects but are intentionally lost on API process restarts because state is in-memory.
