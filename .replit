@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-24", "python-base-3.13"]
 
 [deployment]
 router = "application"
@@ -34,8 +34,8 @@ PORT = "8081"
 BASE_PATH = "/__mockup"
 
 [[workflows.workflow]]
-name = "api-backend"
-mode = "sequential"
+name = "Project"
+mode = "parallel"
 author = "agent"
 
 [[workflows.workflow.tasks]]
@@ -43,34 +43,10 @@ task = "shell.exec"
 args = "cd /home/runner/workspace/artifacts/api-server && npm run dev"
 waitForPort = 3001
 
-[workflows.workflow.metadata]
-outputType = "console"
-
-[[workflows.workflow]]
-name = "scanlex-frontend"
-mode = "sequential"
-author = "agent"
-
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "cd /home/runner/workspace/artifacts/scanlex-ai && PORT=20558 BASE_PATH=/ npm run dev"
 waitForPort = 20558
-
-[workflows.workflow.metadata]
-outputType = "webview"
-
-[[workflows.workflow]]
-name = "Project"
-mode = "parallel"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "api-backend"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "scanlex-frontend"
 
 [agent]
 stack = "PNPM_WORKSPACE"
